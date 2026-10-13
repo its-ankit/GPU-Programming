@@ -1,1 +1,178 @@
 
+#include<iostream>
+#include<cstdio>
+#include<cstdlib>
+#include<sys/time.h>
+#include<cuda.h>
+using namespace std;
+
+
+#define TILE 16
+
+// Optimized kernel: shared-memory tiling + coalesced loads + padding
+// E[i][j] = sum_k A[k][i]*B[k][j] + sum_k C[i][k]*D[j][k]
+__global__ void computeTiled(int p, int q, int r,
+                             const int* A, const int* B,
+                             const int* C, const int* D, int* E) {
+	// As and Ds are written transposed, so they are padded by 2 columns
+	// to avoid shared-memory bank conflicts (16-wide tile, 2 rows per warp)
+	__shared__ int As[TILE][TILE + 2];   // tile of A^T
+	__shared__ int Bs[TILE][TILE];       // tile of B
+	__shared__ int Cs[TILE][TILE];       // tile of C
+	__shared__ int Ds[TILE][TILE + 2];   // tile of D^T
+
+	int tx = threadIdx.x, ty = threadIdx.y;
+	int blockRow = blockIdx.y * TILE;
+	int blockCol = blockIdx.x * TILE;
+	int row = blockRow + ty;              // row of E
+	int col = blockCol + tx;              // col of E
+	int sum = 0;
+
+	for (int k = 0; k < q; k += TILE) {
+		// A: read along a row of A (coalesced), store transposed -> A^T tile
+		As[tx][ty] = (k + ty < q && blockRow + tx < p)
+		             ? A[(k + ty) * p + (blockRow + tx)] : 0;
+		// B and C: already coalesced, stored normally
+		Bs[ty][tx] = (k + ty < q && col < r) ? B[(k + ty) * r + col] : 0;
+		Cs[ty][tx] = (row < p && k + tx < q) ? C[row * q + (k + tx)] : 0;
+		// D: read along a row of D (coalesced), store transposed -> D^T tile
+		Ds[tx][ty] = (blockCol + ty < r && k + tx < q)
+		             ? D[(blockCol + ty) * q + (k + tx)] : 0;
+
+		__syncthreads();   // tiles fully loaded
+
+		for (int kk = 0; kk < TILE; kk++)
+			sum += As[ty][kk] * Bs[kk][tx] + Cs[ty][kk] * Ds[kk][tx];
+
+		__syncthreads();   // everyone done before tiles are overwritten
+	}
+
+	if (row < p && col < r)
+		E[row * r + col] = sum;
+}
+
+// function to compute the output matrix
+void compute(int p, int q, int r, int *h_matrixA, int *h_matrixB,
+	         int *h_matrixC, int *h_matrixD, int *h_matrixE){
+	// Device variables declarations...
+	int *d_matrixA, *d_matrixB, *d_matrixC, *d_matrixD, *d_matrixE;
+
+	// allocate memory...
+	cudaMalloc(&d_matrixA, q * p * sizeof(int));
+	cudaMalloc(&d_matrixB, q * r * sizeof(int));
+	cudaMalloc(&d_matrixC, p * q * sizeof(int));
+	cudaMalloc(&d_matrixD, r * q * sizeof(int));
+	cudaMalloc(&d_matrixE, p * r * sizeof(int));
+
+	// copy the values...
+	cudaMemcpy(d_matrixA, h_matrixA, q * p * sizeof(int), cudaMemcpyHostToDevice);
+	cudaMemcpy(d_matrixB, h_matrixB, q * r * sizeof(int), cudaMemcpyHostToDevice);
+	cudaMemcpy(d_matrixC, h_matrixC, p * q * sizeof(int), cudaMemcpyHostToDevice);
+	cudaMemcpy(d_matrixD, h_matrixD, r * q * sizeof(int), cudaMemcpyHostToDevice);
+
+	/* ****************************************************************** */
+	/* Write your code here */
+	/* Configure and launch kernels */
+	dim3 block(TILE, TILE);
+	dim3 grid((r + TILE - 1) / TILE, (p + TILE - 1) / TILE);
+	computeTiled<<<grid, block>>>(p, q, r, d_matrixA, d_matrixB,
+	                              d_matrixC, d_matrixD, d_matrixE);
+
+	/* ****************************************************************** */
+
+	// copy the result back...
+	cudaMemcpy(h_matrixE, d_matrixE, p * r * sizeof(int), cudaMemcpyDeviceToHost);
+
+	// deallocate the memory...
+	cudaFree(d_matrixA);
+	cudaFree(d_matrixB);
+	cudaFree(d_matrixC);
+	cudaFree(d_matrixD);
+	cudaFree(d_matrixE);
+}
+
+// function to read the input matrices from the input file
+void readMatrix(FILE *inputFilePtr, int *matrix, int rows, int cols) {
+	for(int i=0; i<rows; i++) {
+		for(int j=0; j<cols; j++) {
+			fscanf(inputFilePtr, "%d", &matrix[i*cols+j]);
+		}
+	}
+}
+
+// function to write the output matrix into the output file
+void writeMatrix(FILE *outputFilePtr, int *matrix, int rows, int cols) {
+	for(int i=0; i<rows; i++) {
+		for(int j=0; j<cols; j++) {
+			fprintf(outputFilePtr, "%d ", matrix[i*cols+j]);
+		}
+		fprintf(outputFilePtr, "\n");
+	}
+}
+
+
+
+int main(int argc, char **argv) {
+	// variable declarations
+	int p, q, r;
+	int *matrixA, *matrixB, *matrixC, *matrixD, *matrixE;
+	struct timeval t1, t2;
+	double seconds, microSeconds;
+
+	// get file names from command line
+	char *inputFileName = argv[1];
+	char *outputFileName = argv[2];
+
+	// file pointers
+	FILE *inputFilePtr, *outputFilePtr;
+
+    inputFilePtr = fopen(inputFileName, "r");
+	if(inputFilePtr == NULL) {
+	    printf("Failed to open the input file.!!\n");
+		return 0;
+	}
+
+	// read input values
+	fscanf(inputFilePtr, "%d %d %d", &p, &q, &r);
+
+	// allocate memory and read input matrices
+	matrixA = (int*) malloc(q * p * sizeof(int));
+	matrixB = (int*) malloc(q * r * sizeof(int));
+	matrixC = (int*) malloc(p * q * sizeof(int));
+	matrixD = (int*) malloc(r * q * sizeof(int));
+	readMatrix(inputFilePtr, matrixA, q, p);
+	readMatrix(inputFilePtr, matrixB, q, r);
+	readMatrix(inputFilePtr, matrixC, p, q);
+	readMatrix(inputFilePtr, matrixD, r, q);
+
+	// allocate memory for output matrix
+	matrixE = (int*) malloc(p * r * sizeof(int));
+
+	// call the compute function
+	gettimeofday(&t1, NULL);
+	compute(p, q, r, matrixA, matrixB, matrixC, matrixD, matrixE);
+	cudaDeviceSynchronize();
+	gettimeofday(&t2, NULL);
+
+	// print the time taken by the compute function
+	seconds = t2.tv_sec - t1.tv_sec;
+	microSeconds = t2.tv_usec - t1.tv_usec;
+	printf("Time taken (ms): %.3f\n", 1000*seconds + microSeconds/1000);
+
+	// store the result into the output file
+	outputFilePtr = fopen(outputFileName, "w");
+	writeMatrix(outputFilePtr, matrixE, p, r);
+
+	// close files
+	fclose(inputFilePtr);
+	fclose(outputFilePtr);
+
+	// deallocate memory
+	free(matrixA);
+	free(matrixB);
+	free(matrixC);
+	free(matrixD);
+	free(matrixE);
+
+	return 0;
+}
